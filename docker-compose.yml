@@ -1,0 +1,105 @@
+version: '3.8'
+
+services:
+  # Nginx web server
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/ssl:/etc/nginx/ssl
+      - ./storage/app/public:/var/www/html/storage/app/public
+    depends_on:
+      - app
+    networks:
+      - app-network
+
+  # Laravel application
+  app:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    volumes:
+      - ./:/var/www/html
+      - ./storage:/var/www/html/storage
+    depends_on:
+      - mysql
+      - redis
+    networks:
+      - app-network
+
+  # Stream processing service
+  stream-processor:
+    build:
+      context: ./
+      dockerfile: Dockerfile.ffmpeg
+    volumes:
+      - ./storage:/var/www/html/storage
+    deploy:
+      replicas: 3
+    networks:
+      - app-network
+
+  # Queue worker
+  queue:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    command: php artisan queue:work --tries=3
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      - mysql
+      - redis
+    networks:
+      - app-network
+
+  # WebSocket server
+  websocket:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    command: php artisan websockets:serve
+    ports:
+      - "6001:6001"
+    volumes:
+      - ./:/var/www/html
+    depends_on:
+      - redis
+    networks:
+      - app-network
+
+  # MySQL database
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_DATABASE: ${DB_DATABASE}
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+      MYSQL_USER: ${DB_USERNAME}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - app-network
+
+  # Redis for caching and queues
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  redis-data: 

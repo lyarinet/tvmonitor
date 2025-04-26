@@ -1,0 +1,1715 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Facades\Response;
+use Illuminate\Support\Facades\Log;
+use Symfony\Component\HttpFoundation\StreamedResponse;
+use GuzzleHttp\Client;
+
+class StreamProxyController extends Controller
+{
+    /**
+     * Proxy an HLS playlist
+     */
+    public function proxyPlaylist($streamId)
+    {
+        // Handle OPTIONS request for CORS preflight
+        if (request()->isMethod('OPTIONS')) {
+            return response('', 200)
+                ->header('Access-Control-Allow-Origin', '*')
+                ->header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+                ->header('Access-Control-Allow-Headers', 'Origin, Content-Type, Accept, Authorization, X-Request-With, Range')
+                ->header('Access-Control-Max-Age', '86400'); // 24 hours
+        }
+        
+        // Record the stream request details
+        Log::info("Stream playlist request received", [
+            'streamId' => $streamId,
+            'userAgent' => request()->header('User-Agent'),
+            'referrer' => request()->header('Referer'),
+            'ip' => request()->ip()
+        ]);
+        
+        // First, try to find the stream (can be either output or input stream)
+        $outputStream = \App\Models\OutputStream::find($streamId);
+        $inputStream = null;
+        
+        if (!$outputStream) {
+            $inputStream = \App\Models\InputStream::find($streamId);
+        }
+        
+        if (!$outputStream && !$inputStream) {
+            Log::warning("Stream not found", ['streamId' => $streamId]);
+            return $this->addCorsHeaders(response()->json(['error' => 'Stream not found'], 404));
+        }
+        
+        $streamType = $outputStream ? 'output' : 'input';
+        $streamName = $outputStream ? $outputStream->name : $inputStream->name;
+        $streamStatus = $outputStream ? $outputStream->status : $inputStream->status;
+        
+        Log::debug("Stream details for playlist request", [
+            'streamId' => $streamId,
+            'type' => $streamType,
+            'name' => $streamName,
+            'status' => $streamStatus
+        ]);
+        
+        // Custom URL handling
+        $customUrl = null;
+        $customUrlIsLocal = false;
+        $customStreamId = null;
+        
+        if ($outputStream && !empty($outputStream->url)) {
+            $customUrl = $outputStream->url;
+            $this->parseCustomStreamUrl($customUrl, $streamId, $customStreamId, $customUrlIsLocal);
+        } else if ($inputStream && !empty($inputStream->url)) {
+            $customUrl = $inputStream->url;
+            $this->parseCustomStreamUrl($customUrl, $streamId, $customStreamId, $customUrlIsLocal);
+        }
+        
+        // Create the directory for this stream if it doesn't exist
+        $streamDir = storage_path("app/public/streams/{$streamId}");
+        
+        // If we have a custom stream ID, use that stream's directory instead
+        if ($customStreamId) {
+            $customStreamDir = storage_path("app/public/streams/{$customStreamId}");
+            
+            // Check if the custom stream directory exists and has content
+            if (file_exists($customStreamDir)) {
+                $customDirContent = scandir($customStreamDir);
+                // Remove . and .. from the list
+                $customDirContent = array_diff($customDirContent, ['.', '..']);
+                
+                // If directory is not empty, use it
+                if (count($customDirContent) > 0) {
+                    $streamDir = $customStreamDir;
+                    Log::info("Using custom stream directory", [
+                        'originalStreamId' => $streamId,
+                        'customStreamId' => $customStreamId,
+                        'streamDir' => $streamDir
+                    ]);
+                } else {
+                    Log::warning("Custom stream directory is empty, falling back to original stream", [
+                        'originalStreamId' => $streamId,
+                        'customStreamId' => $customStreamId,
+                        'customStreamDir' => $customStreamDir
+                    ]);
+                }
+            } else {
+                Log::warning("Custom stream directory does not exist, falling back to original stream", [
+                    'originalStreamId' => $streamId,
+                    'customStreamId' => $customStreamId,
+                    'customStreamDir' => $customStreamDir
+                ]);
+            }
+        }
+        
+        if (!file_exists($streamDir)) {
+            try {
+                mkdir($streamDir, 0755, true); // Create recursively if needed
+                Log::info("Created stream directory", ['streamDir' => $streamDir]);
+            } catch (\Exception $e) {
+                Log::error("Failed to create stream directory", [
+                    'streamDir' => $streamDir,
+                    'error' => $e->getMessage()
+                ]);
+                return $this->addCorsHeaders(response()->json(['error' => 'Failed to create stream directory'], 500));
+            }
+        }
+        
+        $playlistPath = $streamDir . '/playlist.m3u8';
+        
+        // Get all available segment files
+        $availableSegments = glob($streamDir . '/segment_*.ts');
+        if (empty($availableSegments)) {
+            $availableSegments = glob($streamDir . '/segment*.ts'); // Try alternative pattern
+        }
+        if (empty($availableSegments)) {
+            $availableSegments = glob($streamDir . '/*.ts'); // Try any TS file
+        }
+        
+        // If we have available segments, always generate a fresh playlist that reflects the current state
+        if (!empty($availableSegments)) {
+            // Sort segments by number
+            usort($availableSegments, function($a, $b) {
+                if (preg_match('/segment_(\d+)\.ts$/', $a, $matchesA) && 
+                    preg_match('/segment_(\d+)\.ts$/', $b, $matchesB)) {
+                    return intval($matchesA[1]) - intval($matchesB[1]);
+                } else if (preg_match('/segment(\d+)\.ts$/', $a, $matchesA) && 
+                           preg_match('/segment(\d+)\.ts$/', $b, $matchesB)) {
+                    return intval($matchesA[1]) - intval($matchesB[1]);
+                } else if (preg_match('/(\d+)\.ts$/', $a, $matchesA) && 
+                           preg_match('/(\d+)\.ts$/', $b, $matchesB)) {
+                    return intval($matchesA[1]) - intval($matchesB[1]);
+                }
+                // Fallback to string comparison if no patterns match
+                return strcmp($a, $b);
+            });
+            
+            // Log all available segments
+            $segmentNumbers = [];
+            foreach ($availableSegments as $segment) {
+                if (preg_match('/segment_(\d+)\.ts$/', $segment, $matches)) {
+                    $segmentNumbers[] = intval($matches[1]);
+                } else if (preg_match('/segment(\d+)\.ts$/', $segment, $matches)) {
+                    $segmentNumbers[] = intval($matches[1]);
+                } else if (preg_match('/(\d+)\.ts$/', $segment, $matches)) {
+                    $segmentNumbers[] = intval($matches[1]);
+                }
+            }
+            sort($segmentNumbers);
+            
+            Log::info("Available segments", [
+                'streamId' => $streamId,
+                'count' => count($segmentNumbers),
+                'first' => reset($segmentNumbers) ?: null,
+                'last' => end($segmentNumbers) ?: null,
+                'all' => $segmentNumbers
+            ]);
+            
+            // Use only segments that actually exist - don't reference future segments
+            $segmentsToInclude = [];
+            $segmentPaths = [];
+            
+            // Get the last 5 segments (or all if less than 5)
+            $numSegmentsToInclude = min(5, count($availableSegments));
+            $segmentsToUse = array_slice($availableSegments, -$numSegmentsToInclude);
+            
+            foreach ($segmentsToUse as $segment) {
+                $segmentNum = null;
+                $segmentPath = null;
+                
+                // Extract segment number and format
+                if (preg_match('/segment_(\d+)\.ts$/', $segment, $matches)) {
+                    $segmentNum = intval($matches[1]);
+                    $segmentPath = "segment_{$matches[1]}.ts";
+                } else if (preg_match('/segment(\d+)\.ts$/', $segment, $matches)) {
+                    $segmentNum = intval($matches[1]);
+                    $segmentPath = "segment{$matches[1]}.ts";
+                } else if (preg_match('/(\d+)\.ts$/', $segment, $matches)) {
+                    $segmentNum = intval($matches[1]);
+                    $segmentPath = "{$matches[1]}.ts";
+                }
+                
+                if ($segmentNum !== null && $segmentPath !== null) {
+                    $segmentsToInclude[] = $segmentNum;
+                    $segmentPaths[$segmentNum] = $segmentPath;
+                }
+            }
+            
+            // Sort by segment number
+            sort($segmentsToInclude);
+            
+            Log::info("Segments to include in playlist", [
+                'streamId' => $streamId,
+                'count' => count($segmentsToInclude),
+                'segments' => $segmentsToInclude,
+                'paths' => $segmentPaths
+            ]);
+            
+            if (!empty($segmentsToInclude)) {
+                // Generate a new playlist with only available segments
+                $newPlaylist = "#EXTM3U\n";
+                $newPlaylist .= "#EXT-X-VERSION:3\n";
+                $newPlaylist .= "#EXT-X-ALLOW-CACHE:NO\n";
+                $newPlaylist .= "#EXT-X-TARGETDURATION:4\n"; // Allow for slightly longer segments 
+                $newPlaylist .= "#EXT-X-MEDIA-SEQUENCE:" . $segmentsToInclude[0] . "\n";
+                // Only include the most essential and widely supported tags
+                $newPlaylist .= "#EXT-X-DISCONTINUITY-SEQUENCE:0\n"; // Reset discontinuity sequence
+                
+                // Determine segment durations more accurately if possible
+                $segmentDurations = [];
+                $segmentDiscontinuities = [];
+                $previousSegmentHasError = false;
+                
+                foreach ($segmentsToInclude as $segNum) {
+                    $segmentPath = $streamDir . '/' . $segmentPaths[$segNum];
+                    $duration = 2.0; // Default duration
+                    
+                    // Check for TS discontinuities in the segment
+                    $hasDiscontinuity = false;
+                    if (file_exists($segmentPath) && filesize($segmentPath) > 1000) {
+                        $checkCommand = 'ffprobe -v error ' . escapeshellarg($segmentPath) . ' 2>&1';
+                        exec($checkCommand, $checkOutput, $checkReturnCode);
+                        
+                        foreach ($checkOutput as $line) {
+                            if (stripos($line, 'TS discontinuity') !== false) {
+                                $hasDiscontinuity = true;
+                                Log::info("Detected TS discontinuity in segment {$segNum}", [
+                                    'segment' => $segNum,
+                                    'error' => $line
+                                ]);
+                                break;
+                            }
+                        }
+                    }
+                    $segmentDiscontinuities[$segNum] = $hasDiscontinuity;
+                    
+                    // Attempt to get actual duration with ffprobe if file exists
+                    if (file_exists($segmentPath) && filesize($segmentPath) > 1000) {
+                        try {
+                            $probeCommand = 'ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 ' . 
+                                           escapeshellarg($segmentPath) . ' 2>&1';
+                            
+                            exec($probeCommand, $probeOutput, $probeReturnCode);
+                            
+                            if ($probeReturnCode === 0 && !empty($probeOutput) && is_numeric($probeOutput[0])) {
+                                $probedDuration = floatval($probeOutput[0]);
+                                
+                                // Use probed duration if reasonable (between 0.5 and 10 seconds)
+                                if ($probedDuration >= 0.5 && $probedDuration <= 10.0) {
+                                    $duration = $probedDuration;
+                                    Log::debug("Using probed segment duration", [
+                                        'segment' => $segNum,
+                                        'duration' => $duration
+                                    ]);
+                                }
+                            }
+                        } catch (\Exception $e) {
+                            Log::warning("Error probing segment duration", [
+                                'segment' => $segNum,
+                                'error' => $e->getMessage()
+                            ]);
+                        }
+                    }
+                    
+                    $segmentDurations[$segNum] = $duration;
+                }
+                
+                // Calculate a timestamp for program date time tags
+                $timestamp = time();
+                
+                foreach ($segmentsToInclude as $segNum) {
+                    // Check if we need to insert a discontinuity marker
+                    $needsDiscontinuityMarker = false;
+                    
+                    // Add discontinuity marker if this segment has TS errors
+                    if (isset($segmentDiscontinuities[$segNum]) && $segmentDiscontinuities[$segNum]) {
+                        $needsDiscontinuityMarker = true;
+                    }
+                    
+                    // Also add discontinuity if the previous segment had errors and this one doesn't
+                    if ($previousSegmentHasError && (!isset($segmentDiscontinuities[$segNum]) || !$segmentDiscontinuities[$segNum])) {
+                        $needsDiscontinuityMarker = true;
+                    }
+                    
+                    // Update the previous segment error flag
+                    $previousSegmentHasError = isset($segmentDiscontinuities[$segNum]) && $segmentDiscontinuities[$segNum];
+                    
+                    // Add discontinuity marker if needed
+                    if ($needsDiscontinuityMarker) {
+                        $newPlaylist .= "#EXT-X-DISCONTINUITY\n";
+                        Log::info("Added discontinuity marker before segment {$segNum}");
+                    }
+                    
+                    // Format the date for the program date time tag
+                    $dateTime = new \DateTime();
+                    $dateTime->setTimestamp($timestamp);
+                    $formattedDate = $dateTime->format('Y-m-d\TH:i:s.vP');
+                    
+                    // Use the determined duration, fallback to 2.0 seconds
+                    $duration = isset($segmentDurations[$segNum]) ? $segmentDurations[$segNum] : 2.0;
+                    
+                    // Round to 6 decimal places for EXTINF
+                    $durationFormatted = number_format($duration, 6, '.', '');
+                    
+                    $newPlaylist .= "#EXTINF:{$durationFormatted},\n";
+                    // Make program date time optional to avoid parsing errors
+                    $newPlaylist .= "#EXT-X-PROGRAM-DATE-TIME:{$formattedDate}\n";
+                    // Ensure the segment URL is properly formatted - simply use the local filename
+                    $newPlaylist .= $segmentPaths[$segNum] . "\n";
+                    
+                    // Increment timestamp for next segment
+                    $timestamp += $duration;
+                }
+                
+                // Update the playlist file
+                file_put_contents($playlistPath, $newPlaylist);
+                
+                Log::info("Generated fresh playlist with only existing segments", [
+                    'streamId' => $streamId,
+                    'segmentCount' => count($segmentsToInclude),
+                    'lowestSegment' => $segmentsToInclude[0],
+                    'highestSegment' => end($segmentsToInclude)
+                ]);
+                
+                return response($newPlaylist, 200, [
+                    'Content-Type' => 'application/vnd.apple.mpegurl',
+                    'Cache-Control' => 'no-cache, no-store, must-revalidate',
+                    'Pragma' => 'no-cache',
+                    'Expires' => '0',
+                    'Access-Control-Allow-Origin' => '*',
+                    'Connection' => 'keep-alive',
+                    'X-Accel-Buffering' => 'no' // Disable nginx buffering
+                ]);
+            }
+        }
+        
+        // If we get here, either there are no segments or we couldn't generate a playlist
+        // Check if there's an existing playlist file to return
+        if (file_exists($playlistPath) && is_file($playlistPath)) {
+            Log::info("Using existing playlist file", ['playlistPath' => $playlistPath]);
+            
+            // Return the playlist file
+            return response()->file($playlistPath, [
+                'Content-Type' => 'application/vnd.apple.mpegurl',
+                'Cache-Control' => 'no-cache'
+            ]);
+        }
+        
+        // If we have a custom URL that's a local path but not pointing to another stream,
+        // try to read it directly
+        if ($customUrl && $customUrlIsLocal && !$customStreamId) {
+            $customPlaylistPath = $customUrl;
+            
+            // If the path is not absolute, make it absolute
+            if (strpos($customPlaylistPath, '/') !== 0) {
+                $customPlaylistPath = base_path($customPlaylistPath);
+            }
+            
+            if (file_exists($customPlaylistPath) && is_file($customPlaylistPath)) {
+                Log::info("Using custom URL playlist file directly", [
+                    'customPlaylistPath' => $customPlaylistPath
+                ]);
+                
+                return response()->file($customPlaylistPath, [
+                    'Content-Type' => 'application/vnd.apple.mpegurl',
+                    'Cache-Control' => 'no-cache'
+                ]);
+            } else {
+                Log::warning("Custom URL playlist file not found", [
+                    'customPlaylistPath' => $customPlaylistPath
+                ]);
+            }
+        }
+        
+        // If no playlist file is found, try to generate one from available segment files
+        $segmentFiles = glob($streamDir . '/*.ts');
+        
+        if (!empty($segmentFiles)) {
+            // Sort segment files by their number
+            usort($segmentFiles, function($a, $b) {
+                $numA = intval(pathinfo($a, PATHINFO_FILENAME));
+                $numB = intval(pathinfo($b, PATHINFO_FILENAME));
+                return $numA - $numB;
+            });
+            
+            // Generate a new playlist
+            $segmentDuration = 10; // Default segment duration
+            $playlist = "#EXTM3U\n";
+            $playlist .= "#EXT-X-VERSION:3\n";
+            $playlist .= "#EXT-X-TARGETDURATION:{$segmentDuration}\n";
+            $playlist .= "#EXT-X-MEDIA-SEQUENCE:1\n";
+            
+            foreach ($segmentFiles as $segmentFile) {
+                $segmentName = basename($segmentFile);
+                $playlist .= "#EXTINF:{$segmentDuration},\n";
+                $playlist .= "{$segmentName}\n";
+            }
+            
+            // Don't add the end marker if the stream is still active
+            if ($streamStatus !== 'active') {
+                $playlist .= "#EXT-X-ENDLIST\n";
+            }
+            
+            // Save the generated playlist
+            file_put_contents($playlistPath, $playlist);
+            
+            Log::info("Generated playlist from segment files", [
+                'playlistPath' => $playlistPath,
+                'segmentCount' => count($segmentFiles)
+            ]);
+            
+            return response($playlist, 200, [
+                'Content-Type' => 'application/vnd.apple.mpegurl',
+                'Cache-Control' => 'no-cache'
+            ]);
+        }
+        
+        // If we have a custom URL that's external, try to proxy the input stream
+        if ($customUrl && !$customUrlIsLocal) {
+            try {
+                $client = new \GuzzleHttp\Client(['timeout' => 5]);
+                $response = $client->get($customUrl);
+                
+                if ($response->getStatusCode() == 200) {
+                    $playlist = (string) $response->getBody();
+                    
+                    // We could modify the playlist here if needed
+                    // For example, rewrite segment URLs to be proxied through our application
+                    
+                    // Save the retrieved playlist
+                    file_put_contents($playlistPath, $playlist);
+                    
+                    Log::info("Retrieved playlist from external URL", [
+                        'customUrl' => $customUrl,
+                        'playlistPath' => $playlistPath
+                    ]);
+                    
+                    return response($playlist, 200, [
+                        'Content-Type' => 'application/vnd.apple.mpegurl',
+                        'Cache-Control' => 'no-cache'
+                    ]);
+                }
+            } catch (\Exception $e) {
+                Log::error("Failed to retrieve playlist from external URL", [
+                    'customUrl' => $customUrl,
+                    'error' => $e->getMessage()
+                ]);
+            }
+        }
+        
+        // If we reach here, we could not provide a valid playlist
+        Log::warning("Could not find or generate playlist", ['streamId' => $streamId]);
+        
+        // Return an empty playlist with a message
+        $emptyPlaylist = "#EXTM3U\n";
+        $emptyPlaylist .= "#EXT-X-VERSION:3\n";
+        $emptyPlaylist .= "#EXT-X-TARGETDURATION:10\n";
+        $emptyPlaylist .= "#EXT-X-MEDIA-SEQUENCE:1\n";
+        $emptyPlaylist .= "#EXT-X-DISCONTINUITY\n";
+        $emptyPlaylist .= "#EXTINF:10.0,\n";
+        $emptyPlaylist .= "#EXT-X-STREAM-INF: BANDWIDTH=128000, RESOLUTION=320x240\n";
+        $emptyPlaylist .= "#EXT-X-ENDLIST\n";
+        
+        Log::info("Generating empty playlist with message: Stream unavailable. Please check if the stream is active.");
+        
+        return response($emptyPlaylist, 200, [
+            'Content-Type' => 'application/vnd.apple.mpegurl',
+            'Cache-Control' => 'no-cache'
+        ]);
+    }
+    
+    /**
+     * Check if content appears to be a valid M3U8 playlist
+     */
+    private function isValidM3u8($content) {
+        if (empty($content)) {
+            return false;
+        }
+        
+        // Basic validation - check for essential HLS tags
+        if (strpos($content, '#EXTM3U') !== 0) {
+            return false;
+        }
+        
+        // Additional validation
+        if (strpos($content, '#EXT-X-VERSION') === false) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Send a properly formatted playlist response
+     */
+    private function sendPlaylistResponse($content) {
+        return response($content, 200, [
+            'Content-Type' => 'application/vnd.apple.mpegurl',
+            'Access-Control-Allow-Origin' => '*',
+            'Access-Control-Allow-Methods' => 'GET, OPTIONS',
+            'Access-Control-Allow-Headers' => 'Origin, Content-Type, Accept, Authorization, X-Request-With, Range',
+            'Cache-Control' => 'no-cache',
+            'Content-Length' => strlen($content)
+        ]);
+    }
+    
+    /**
+     * Generate an empty playlist with an informational message
+     */
+    private function generateEmptyPlaylist($message = "Stream unavailable") {
+        Log::info("Generating empty playlist with message: " . $message);
+        
+        // Create a minimal, standards-compliant playlist
+        $errorPlaylist = "#EXTM3U\n";
+        $errorPlaylist .= "#EXT-X-VERSION:3\n";
+        $errorPlaylist .= "#EXT-X-TARGETDURATION:2\n";
+        $errorPlaylist .= "#EXT-X-MEDIA-SEQUENCE:0\n";
+        $errorPlaylist .= "#EXTINF:2.0,\n";
+        
+        // Use the actual stream ID from the request if available
+        $streamId = request()->route('streamId') ?? 0;
+        $emptySegmentUrl = url("/stream-proxy/{$streamId}/empty.ts");
+        
+        $errorPlaylist .= "{$emptySegmentUrl}\n";
+        $errorPlaylist .= "#EXT-X-ENDLIST\n";
+        
+        return $this->sendPlaylistResponse($errorPlaylist);
+    }
+    
+    /**
+     * Generate a playlist from segment files
+     */
+    private function generatePlaylistFromSegments($streamDir, $segmentFiles) {
+        Log::info("Generating playlist from segments", [
+            'streamDir' => $streamDir,
+            'segmentCount' => count($segmentFiles)
+        ]);
+        
+        // Sort by segment number
+        usort($segmentFiles, function($a, $b) {
+            preg_match('/segment_?(\d+)\.ts$/', basename($a), $matchesA);
+            preg_match('/segment_?(\d+)\.ts$/', basename($b), $matchesB);
+            
+            $numA = isset($matchesA[1]) ? (int)$matchesA[1] : 0;
+            $numB = isset($matchesB[1]) ? (int)$matchesB[1] : 0;
+            
+            return $numA - $numB;
+        });
+        
+        // Get segments in order
+        $segmentNumbers = [];
+        foreach ($segmentFiles as $file) {
+            preg_match('/segment_?(\d+)\.ts$/', basename($file), $matches);
+            if (isset($matches[1])) {
+                $segmentNumbers[] = (int)$matches[1];
+            }
+        }
+        
+        if (empty($segmentNumbers)) {
+            Log::warning("No valid segment numbers found");
+            return $this->generateEmptyPlaylist("No valid segments found");
+        }
+        
+        // Create playlist
+        $playlist = "#EXTM3U\n";
+        $playlist .= "#EXT-X-VERSION:3\n";
+        $playlist .= "#EXT-X-ALLOW-CACHE:NO\n";
+        $playlist .= "#EXT-X-TARGETDURATION:2\n";
+        $playlist .= "#EXT-X-MEDIA-SEQUENCE:{$segmentNumbers[0]}\n";
+        
+        // Get the stream ID from the directory path
+        $stream_id = basename(dirname($streamDir));
+        $proxyUrl = url("/stream-proxy/{$stream_id}/segment/");
+        if (!str_ends_with($proxyUrl, '/')) {
+            $proxyUrl .= '/';
+        }
+        
+        // Calculate a timestamp for program date time tags
+        $timestamp = time();
+        $timestampIncrement = 2.0; // Default segment duration
+        
+        // Include all segments, but limit to the last 10 to avoid overwhelming the player
+        $maxSegments = 10;
+        $segmentsToInclude = count($segmentNumbers) > $maxSegments 
+            ? array_slice($segmentNumbers, -$maxSegments) 
+            : $segmentNumbers;
+        
+        foreach ($segmentsToInclude as $segmentNumber) {
+            // Calculate timestamp for this segment
+            $formattedDate = gmdate("Y-m-d\TH:i:s", $timestamp) . '.000Z';
+            
+            // Add segment info
+            $playlist .= "#EXTINF:2.0,\n";
+            $playlist .= "#EXT-X-PROGRAM-DATE-TIME:{$formattedDate}\n";
+            $playlist .= "{$proxyUrl}{$segmentNumber}.ts\n";
+            
+            // Increment timestamp for next segment
+            $timestamp += $timestampIncrement;
+        }
+        
+        // Save the generated playlist
+        file_put_contents("{$streamDir}/playlist.m3u8", $playlist);
+        
+        Log::info("Generated playlist from segments", [
+            'segmentCount' => count($segmentsToInclude),
+            'firstSegment' => reset($segmentsToInclude),
+            'lastSegment' => end($segmentsToInclude)
+        ]);
+        
+        return $playlist;
+    }
+    
+    /**
+     * Preload the next segment to help prevent buffer stalls
+     * 
+     * @param string $streamDir Directory containing the segments
+     * @param int $currentSegment Current segment number
+     * @return void
+     */
+    private function preloadNextSegment($streamDir, $currentSegment)
+    {
+        $nextSegment = $currentSegment + 1;
+        
+        // Check if next segment exists
+        $nextSegmentPatterns = [
+            "{$streamDir}/segment_{$nextSegment}.ts",
+            "{$streamDir}/segment{$nextSegment}.ts",
+            "{$streamDir}/{$nextSegment}.ts"
+        ];
+        
+        foreach ($nextSegmentPatterns as $pattern) {
+            if (file_exists($pattern)) {
+                Log::debug("Next segment already exists, no preloading needed", [
+                    'nextSegment' => $nextSegment,
+                    'path' => $pattern
+                ]);
+                return;
+            }
+        }
+        
+        // No next segment found, start async preload job for the next segment
+        // This is a non-blocking operation that runs in the background
+        try {
+            Log::info("Starting async job to preload next segment", [
+                'currentSegment' => $currentSegment,
+                'nextSegment' => $nextSegment
+            ]);
+            
+            // You could dispatch a Laravel job here to fetch/generate the next segment
+            // For now, we'll just log that it should happen
+            // \App\Jobs\PreloadSegment::dispatch($streamDir, $nextSegment);
+        } catch (\Exception $e) {
+            Log::warning("Failed to start preload job", [
+                'error' => $e->getMessage()
+            ]);
+        }
+    }
+    
+    /**
+     * Proxy an HLS segment file
+     */
+    public function proxySegment($streamId, $segmentNumber)
+    {
+        // Handle OPTIONS request for CORS preflight
+        if (request()->isMethod('OPTIONS')) {
+            return response('', 200)
+                ->header('Access-Control-Allow-Origin', '*')
+                ->header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+                ->header('Access-Control-Allow-Headers', 'Origin, Content-Type, Accept, Authorization, X-Request-With, Range')
+                ->header('Access-Control-Max-Age', '86400'); // 24 hours
+        }
+        
+        // Clean up segment number by removing file extension if present
+        if (str_ends_with($segmentNumber, '.ts')) {
+            $segmentNumber = substr($segmentNumber, 0, -3); // Remove .ts extension
+        }
+        
+        // Handle segment numbers with leading zeros (e.g., 002 -> 2)
+        if (is_string($segmentNumber) && preg_match('/^0+(\d+)$/', $segmentNumber, $matches)) {
+            $originalSegmentNumber = $segmentNumber;
+            $segmentNumber = $matches[1]; // Extract the number without leading zeros
+            Log::info("Normalized segment number by removing leading zeros", [
+                'originalSegmentNumber' => $originalSegmentNumber,
+                'normalizedSegmentNumber' => $segmentNumber
+            ]);
+        }
+        
+        if (!is_numeric($segmentNumber)) {
+            Log::warning("Invalid segment number format", [
+                'streamId' => $streamId,
+                'segmentNumber' => $segmentNumber
+            ]);
+            return $this->addCorsHeaders(response()->json(['error' => 'Invalid segment number'], 400));
+        }
+        
+        // Convert to integer
+        $segmentNumber = intval($segmentNumber);
+
+        // Detailed request logging
+        Log::info("Segment request received", [
+            'streamId' => $streamId,
+            'segmentNumber' => $segmentNumber,
+            'userAgent' => request()->header('User-Agent'),
+            'ip' => request()->ip()
+        ]);
+        
+        // First, try to find the stream (can be either output or input stream)
+        $outputStream = \App\Models\OutputStream::find($streamId);
+        $inputStream = null;
+        
+        if (!$outputStream) {
+            $inputStream = \App\Models\InputStream::find($streamId);
+        }
+        
+        $streamType = $outputStream ? 'output' : ($inputStream ? 'input' : 'unknown');
+        $streamName = $outputStream->name ?? $inputStream->name ?? 'Unknown';
+        $streamStatus = $outputStream->status ?? $inputStream->status ?? 'unknown';
+        
+        // Log detailed segment request info
+        Log::info("Processing segment request", [
+            'streamId' => $streamId,
+            'segmentNumber' => $segmentNumber,
+            'streamType' => $streamType,
+            'streamName' => $streamName,
+            'streamStatus' => $streamStatus
+        ]);
+        
+        // Determine the stream directory to use
+        $streamDir = null;
+        
+        // Check if we have a custom URL
+        $customUrl = null;
+        $customUrlIsLocal = false;
+        $customStreamId = null;
+        
+        if ($outputStream && !empty($outputStream->url)) {
+            $customUrl = $outputStream->url;
+            $this->parseCustomStreamUrl($customUrl, $streamId, $customStreamId, $customUrlIsLocal);
+        } else if ($inputStream && !empty($inputStream->url)) {
+            $customUrl = $inputStream->url;
+            $this->parseCustomStreamUrl($customUrl, $streamId, $customStreamId, $customUrlIsLocal);
+        }
+        
+        // If we have a custom stream ID, use that stream's directory instead
+        if ($customStreamId) {
+            $streamDir = storage_path("app/public/streams/{$customStreamId}");
+            Log::info("Using custom stream directory for segment", [
+                'originalStreamId' => $streamId,
+                'customStreamId' => $customStreamId,
+                'streamDir' => $streamDir,
+                'segmentNumber' => $segmentNumber
+            ]);
+        } else {
+            $streamDir = storage_path("app/public/streams/{$streamId}");
+        }
+        
+        // First, get all available segments and determine the valid range
+        $availableSegments = glob("{$streamDir}/segment_*.ts");
+        if (empty($availableSegments)) {
+            $availableSegments = glob("{$streamDir}/segment*.ts"); // Try alternative pattern
+        }
+        if (empty($availableSegments)) {
+            $availableSegments = glob("{$streamDir}/*.ts"); // Try any TS file
+        }
+        
+        if (!empty($availableSegments)) {
+            // Extract segment numbers from filenames
+            $segmentNumbers = [];
+            $segmentFiles = [];
+            
+            foreach ($availableSegments as $segment) {
+                $num = null;
+                if (preg_match('/segment_(\d+)\.ts$/', $segment, $matches)) {
+                    $num = intval($matches[1]);
+                } else if (preg_match('/segment(\d+)\.ts$/', $segment, $matches)) {
+                    $num = intval($matches[1]);
+                } else if (preg_match('/(\d+)\.ts$/', $segment, $matches)) {
+                    $num = intval($matches[1]);
+                }
+                
+                if ($num !== null) {
+                    $segmentNumbers[] = $num;
+                    $segmentFiles[$num] = $segment;
+                }
+            }
+            
+            if (!empty($segmentNumbers)) {
+                sort($segmentNumbers);
+                $lowestSegment = min($segmentNumbers);
+                $highestSegment = max($segmentNumbers);
+                
+                Log::info("Available segment range", [
+                    'streamId' => $streamId,
+                    'lowestSegment' => $lowestSegment,
+                    'highestSegment' => $highestSegment,
+                    'requestedSegment' => $segmentNumber,
+                    'availableSegments' => $segmentNumbers
+                ]);
+                
+                // If the requested segment is in range, serve it
+                if (in_array($segmentNumber, $segmentNumbers)) {
+                    $segmentPath = $segmentFiles[$segmentNumber];
+                    Log::info("Serving exact matching segment", [
+                        'streamId' => $streamId,
+                        'segmentNumber' => $segmentNumber,
+                        'segmentPath' => $segmentPath
+                    ]);
+                    
+                    // Trigger preloading of next segment to avoid buffer stalls
+                    $this->preloadNextSegment($streamDir, $segmentNumber);
+                    
+                    return $this->serveSegment($segmentPath);
+                }
+                
+                // If the requested segment is too old (below our lowest), serve the lowest
+                if ($segmentNumber < $lowestSegment) {
+                    $segmentPath = $segmentFiles[$lowestSegment];
+                    Log::info("Requested segment is too old, serving lowest available", [
+                        'streamId' => $streamId,
+                        'requestedSegment' => $segmentNumber,
+                        'servingSegment' => $lowestSegment,
+                        'segmentPath' => $segmentPath
+                    ]);
+                    
+                    return $this->serveSegment($segmentPath);
+                }
+                
+                // If the requested segment is ahead of our highest, serve the highest
+                if ($segmentNumber > $highestSegment) {
+                    $segmentPath = $segmentFiles[$highestSegment];
+                    Log::info("Requested segment is ahead, serving highest available", [
+                        'streamId' => $streamId,
+                        'requestedSegment' => $segmentNumber,
+                        'servingSegment' => $highestSegment,
+                        'segmentPath' => $segmentPath
+                    ]);
+                    
+                    return $this->serveSegment($segmentPath);
+                }
+                
+                // If the segment is within the range but missing, find the closest available
+                $closestSegment = null;
+                $minDistance = PHP_INT_MAX;
+                
+                foreach ($segmentNumbers as $num) {
+                    $distance = abs($num - $segmentNumber);
+                    if ($distance < $minDistance) {
+                        $minDistance = $distance;
+                        $closestSegment = $num;
+                    }
+                }
+                
+                if ($closestSegment !== null) {
+                    $segmentPath = $segmentFiles[$closestSegment];
+                    Log::info("Serving closest available segment", [
+                        'streamId' => $streamId,
+                        'requestedSegment' => $segmentNumber,
+                        'servingSegment' => $closestSegment,
+                        'segmentPath' => $segmentPath,
+                        'distance' => $minDistance
+                    ]);
+                    
+                    return $this->serveSegment($segmentPath);
+                }
+            }
+        }
+        
+        // If we reach here, continue with the traditional segment pattern checks
+        // Create an array of possible segment patterns to check
+        $segmentPatterns = [
+            "{$streamDir}/segment_{$segmentNumber}.ts",
+            "{$streamDir}/segment{$segmentNumber}.ts",
+            "{$streamDir}/{$segmentNumber}.ts"
+        ];
+        
+        // Also check for segments with zero-padded numbers
+        // For example, segment_002.ts, segment_0002.ts
+        for ($i = 1; $i <= 5; $i++) {
+            $paddedNumber = str_pad($segmentNumber, $i, '0', STR_PAD_LEFT);
+            if ($paddedNumber !== (string)$segmentNumber) { // Only add if different from original
+                $segmentPatterns[] = "{$streamDir}/segment_{$paddedNumber}.ts";
+                $segmentPatterns[] = "{$streamDir}/segment{$paddedNumber}.ts";
+                $segmentPatterns[] = "{$streamDir}/{$paddedNumber}.ts";
+            }
+        }
+        
+        $segmentPath = $segmentPatterns[0]; // Default to first pattern
+        
+        Log::debug("Checking segment patterns", [
+            'streamId' => $streamId,
+            'segmentNumber' => $segmentNumber,
+            'patternsToCheck' => $segmentPatterns
+        ]);
+        
+        // Handle custom URL logic if it's an HTTP URL
+        if ($customUrl && !$customUrlIsLocal && strpos($customUrl, 'http') === 0) {
+            Log::info("Attempting to proxy remote segment", ['customUrl' => $customUrl, 'segmentNumber' => $segmentNumber]);
+            
+            try {
+                // Extract base URL to convert to segment URL
+                $baseUrl = dirname($customUrl);
+                
+                // Create an array of possible remote segment patterns to try
+                $segmentUrlPatterns = [
+                    "{$baseUrl}/segment_{$segmentNumber}.ts",
+                    "{$baseUrl}/segment{$segmentNumber}.ts",
+                    "{$baseUrl}/{$segmentNumber}.ts"
+                ];
+                
+                // Also try with zero-padded numbers
+                for ($i = 1; $i <= 5; $i++) {
+                    $paddedNumber = str_pad($segmentNumber, $i, '0', STR_PAD_LEFT);
+                    if ($paddedNumber !== $segmentNumber) { // Only add if different from original
+                        $segmentUrlPatterns[] = "{$baseUrl}/segment_{$paddedNumber}.ts";
+                        $segmentUrlPatterns[] = "{$baseUrl}/segment{$paddedNumber}.ts";
+                        $segmentUrlPatterns[] = "{$baseUrl}/{$paddedNumber}.ts";
+                    }
+                }
+                
+                // Log attempted URL formats
+                Log::info("Trying multiple segment URL formats", [
+                    'segmentUrlPatterns' => $segmentUrlPatterns
+                ]);
+                
+                $client = new \GuzzleHttp\Client([
+                    'timeout' => 10,
+                    'connect_timeout' => 5,
+                    'verify' => false // Skip SSL verification
+                ]);
+                
+                $segmentContent = null;
+                
+                // Try each pattern until we find one that works
+                foreach ($segmentUrlPatterns as $patternUrl) {
+                    try {
+                        $response = $client->get($patternUrl, [
+                            'headers' => [
+                                'User-Agent' => 'TVMonitor/1.0 HLS Proxy',
+                                'Accept' => '*/*'
+                            ]
+                        ]);
+                        
+                        if ($response->getStatusCode() === 200) {
+                            $segmentContent = $response->getBody()->getContents();
+                            Log::info("Successfully proxied remote segment", [
+                                'segmentUrl' => $patternUrl
+                            ]);
+                            break;
+                        }
+                    } catch (\Exception $e) {
+                        Log::warning("Failed to retrieve segment with pattern", [
+                            'pattern' => $patternUrl,
+                            'error' => $e->getMessage()
+                        ]);
+                        // Continue to the next pattern
+                    }
+                }
+                
+                if ($segmentContent) {
+                    // Make sure the stream directory exists before saving
+                    if (!file_exists($streamDir)) {
+                        if (!mkdir($streamDir, 0755, true) && !is_dir($streamDir)) {
+                            Log::error("Failed to create stream directory", ['streamDir' => $streamDir]);
+                            // Continue anyway to return the segment data
+                        }
+                    }
+                    
+                    // Save the segment file for future use
+                    file_put_contents($segmentPath, $segmentContent);
+                    
+                    return $this->serveSegment($segmentPath);
+                }
+            } catch (\Exception $e) {
+                Log::error("Failed to proxy remote segment", [
+                    'segmentUrl' => isset($segmentUrlPatterns) ? implode(', ', $segmentUrlPatterns) : 'unknown',
+                    'error' => $e->getMessage()
+                ]);
+            }
+        }
+        
+        // Check if the stream directory exists
+        if (!file_exists($streamDir)) {
+            Log::warning("Stream directory not found for segment request", [
+                'streamId' => $customStreamId ?? $streamId,
+                'streamDir' => $streamDir
+            ]);
+            
+            // Try to create the directory
+            if (!mkdir($streamDir, 0755, true) && !is_dir($streamDir)) {
+                Log::error("Failed to create stream directory", [
+                    'streamId' => $customStreamId ?? $streamId,
+                    'streamDir' => $streamDir
+                ]);
+            }
+            
+            // Return fallback empty segment instead of error for better playback
+            Log::info("Serving empty fallback segment (directory not found)", [
+                'streamId' => $customStreamId ?? $streamId,
+                'segmentNumber' => $segmentNumber
+            ]);
+            
+            return $this->createEmptySegment();
+        }
+        
+        // Check all possible segment patterns
+        foreach ($segmentPatterns as $pattern) {
+            if (file_exists($pattern)) {
+                Log::info("Found segment with pattern", [
+                    'streamId' => $customStreamId ?? $streamId,
+                    'segmentNumber' => $segmentNumber,
+                    'pattern' => $pattern
+                ]);
+                
+                return $this->serveSegment($pattern);
+            }
+        }
+        
+        // If we reached here, the segment was not found with any pattern
+        Log::info("Segment file not found with any pattern", [
+            'streamId' => $customStreamId ?? $streamId,
+            'segmentNumber' => $segmentNumber,
+            'patternsChecked' => $segmentPatterns
+        ]);
+        
+        // Check if we have any segments available
+        $availableSegments = glob("{$streamDir}/segment_*.ts");
+        if (empty($availableSegments)) {
+            $availableSegments = glob("{$streamDir}/segment*.ts"); // Try alternative pattern
+        }
+        if (empty($availableSegments)) {
+            $availableSegments = glob("{$streamDir}/*.ts"); // Try any TS file
+        }
+        
+        if (empty($availableSegments)) {
+            Log::warning("No segments available for stream", [
+                'streamId' => $customStreamId ?? $streamId,
+                'requestedSegment' => $segmentNumber
+            ]);
+            
+            // Return fallback empty segment instead of error for better playback
+            Log::info("Serving empty fallback segment (no segments found)", [
+                'streamId' => $customStreamId ?? $streamId,
+                'segmentNumber' => $segmentNumber
+            ]);
+            
+            return $this->createEmptySegment();
+        }
+        
+        // Try to find the latest available segment
+        $latestSegment = null;
+        $latestSegmentNumber = 0;
+        
+        foreach ($availableSegments as $segment) {
+            if (preg_match('/segment_?(\d+)\.ts$/', $segment, $matches)) {
+                $num = (int)$matches[1];
+                if ($num > $latestSegmentNumber) {
+                    $latestSegmentNumber = $num;
+                    $latestSegment = $segment;
+                }
+            } else if (preg_match('/(\d+)\.ts$/', $segment, $matches)) {
+                // Also handle plain numeric segments
+                $num = (int)$matches[1];
+                if ($num > $latestSegmentNumber) {
+                    $latestSegmentNumber = $num;
+                    $latestSegment = $segment;
+                }
+            }
+        }
+        
+        // Apply special handling to all streams
+        // If requested segment is ahead of what we have, serve the most recent one
+        // This helps with HLS.js fragLoadError when segments are requested that don't exist yet
+        if ($latestSegment && $segmentNumber > $latestSegmentNumber) {
+            Log::info("Requested segment ahead of available - serving latest", [
+                'streamId' => $customStreamId ?? $streamId,
+                'requestedSegment' => $segmentNumber,
+                'servingSegment' => $latestSegmentNumber,
+                'gap' => $segmentNumber - $latestSegmentNumber
+            ]);
+            
+            return $this->serveSegment($latestSegment);
+        }
+        
+        // If we have a latest segment and it's not too old, serve it
+        if ($latestSegment && ($segmentNumber - $latestSegmentNumber) < 10) {
+            Log::info("Segment not found, serving latest available segment instead", [
+                'streamId' => $customStreamId ?? $streamId,
+                'requestedSegment' => $segmentNumber,
+                'servingSegment' => $latestSegmentNumber
+            ]);
+            
+            return $this->serveSegment($latestSegment);
+        }
+        
+        // Return fallback empty segment instead of error for better playback
+        Log::info("Serving empty fallback segment", [
+            'streamId' => $customStreamId ?? $streamId,
+            'requestedSegment' => $segmentNumber,
+            'latestAvailable' => $latestSegmentNumber
+        ]);
+        
+        return $this->createEmptySegment();
+    }
+    
+    /**
+     * Proxy a DASH manifest file (.mpd)
+     */
+    public function proxyDashManifest($streamId)
+    {
+        $basePath = storage_path("app/public/streams/{$streamId}");
+        $manifestPath = "{$basePath}/manifest.mpd";
+        
+        Log::info("Stream proxy DASH manifest request", [
+            'streamId' => $streamId,
+            'manifestPath' => $manifestPath
+        ]);
+
+        if (!file_exists($manifestPath)) {
+            Log::warning("DASH manifest file not found", [
+                'streamId' => $streamId,
+                'manifestPath' => $manifestPath
+            ]);
+            return response()->json(['error' => 'DASH manifest not found'], 404);
+        }
+
+        // Read the manifest file
+        $manifest = file_get_contents($manifestPath);
+        
+        // Base URL for the segments
+        $proxyBaseUrl = url("/stream-proxy/{$streamId}/dash/");
+        if (!str_ends_with($proxyBaseUrl, '/')) {
+            $proxyBaseUrl .= '/';
+        }
+        
+        // Check if initialization segments exist
+        $initSegments = glob("{$basePath}/init-stream*.m4s");
+        $mediaSegments = glob("{$basePath}/chunk-stream*.m4s");
+        
+        Log::info("DASH stream files", [
+            'streamId' => $streamId,
+            'initSegmentsCount' => count($initSegments),
+            'mediaSegmentsCount' => count($mediaSegments)
+        ]);
+        
+        // Find the SegmentTemplate elements and update them
+        // We need to use DOMDocument to properly parse and modify the XML
+        $tempFile = tempnam(sys_get_temp_dir(), 'dash_');
+        file_put_contents($tempFile, $manifest);
+        
+        // Create a copy of the original manifest to work with
+        $rewrittenManifest = $manifest;
+        
+        // Using regex to find and replace initialization and media templates
+        // This handles both standard attributes and template variables
+        
+        // Replace initialization templates: initialization="init-stream$RepresentationID$.m4s"
+        $rewrittenManifest = preg_replace(
+            '/initialization="([^"]+)"/i',
+            'initialization="' . $proxyBaseUrl . '$1"',
+            $rewrittenManifest
+        );
+        
+        // Replace media templates: media="chunk-stream$RepresentationID$-$Number%05d$.m4s"
+        $rewrittenManifest = preg_replace(
+            '/media="([^"]+)"/i',
+            'media="' . $proxyBaseUrl . '$1"',
+            $rewrittenManifest
+        );
+        
+        // Handle any BaseURL elements that might be in the manifest
+        $rewrittenManifest = preg_replace(
+            '/<BaseURL>([^<]+)<\/BaseURL>/i',
+            '<BaseURL>' . $proxyBaseUrl . '</BaseURL>',
+            $rewrittenManifest
+        );
+        
+        // Clean up the temp file
+        @unlink($tempFile);
+        
+        Log::info("Serving rewritten DASH manifest", [
+            'streamId' => $streamId,
+            'sample' => substr($rewrittenManifest, 0, 200),
+            'proxyBaseUrl' => $proxyBaseUrl
+        ]);
+        
+        return response($rewrittenManifest, 200, [
+            'Content-Type' => 'application/dash+xml',
+            'Access-Control-Allow-Origin' => '*',
+            'Access-Control-Allow-Methods' => 'GET, OPTIONS',
+            'Access-Control-Allow-Headers' => 'Origin, Content-Type, Accept, Authorization, X-Request-With',
+            'Cache-Control' => 'no-cache, must-revalidate',
+        ]);
+    }
+    
+    /**
+     * Proxy a DASH media segment file (.m4s)
+     */
+    public function proxyDashSegment($streamId, $segmentPath)
+    {
+        $basePath = storage_path("app/public/streams/{$streamId}");
+        
+        // Clean up the segment path to handle any URL encodings or template variables
+        $segmentPath = rawurldecode($segmentPath);
+        
+        // Log the original request
+        Log::info("Stream proxy DASH segment request", [
+            'streamId' => $streamId,
+            'originalSegmentPath' => $segmentPath
+        ]);
+        
+        // Handle template substitution if needed (in case the player sends the template variables)
+        $segmentPath = preg_replace('/\$RepresentationID\$/', '*', $segmentPath);
+        $segmentPath = preg_replace('/\$Number(%[^$]+)?\$/', '*', $segmentPath);
+        
+        // Check if the path contains wildcards and use glob to find matching files
+        if (strpos($segmentPath, '*') !== false) {
+            $files = glob("{$basePath}/{$segmentPath}");
+            
+            // Sort files by modification time and get the latest one
+            if (!empty($files)) {
+                usort($files, function($a, $b) {
+                    return filemtime($b) - filemtime($a);
+                });
+                $fullPath = $files[0];
+            } else {
+                $fullPath = "{$basePath}/{$segmentPath}";
+            }
+        } else {
+            $fullPath = "{$basePath}/{$segmentPath}";
+        }
+        
+        Log::info("Resolved segment path", [
+            'streamId' => $streamId,
+            'originalSegmentPath' => $segmentPath,
+            'resolvedPath' => $fullPath
+        ]);
+        
+        if (!file_exists($fullPath)) {
+            // If exact file doesn't exist, try to find a similar file
+            $pattern = preg_replace('/[0-9]+/', '*', $segmentPath);
+            $candidates = glob("{$basePath}/{$pattern}");
+            
+            if (!empty($candidates)) {
+                // Sort by name to get the most recent one
+                sort($candidates);
+                $fullPath = end($candidates);
+                
+                Log::info("Found alternative segment", [
+                    'streamId' => $streamId,
+                    'originalSegmentPath' => $segmentPath,
+                    'alternativePath' => $fullPath
+                ]);
+            } else {
+                Log::warning("DASH segment file not found", [
+                    'streamId' => $streamId,
+                    'segmentPath' => $segmentPath,
+                    'pattern' => $pattern
+                ]);
+                return response()->json(['error' => 'DASH segment not found'], 404);
+            }
+        }
+        
+        // Determine the content type based on file extension
+        $contentType = 'video/mp4';
+        if (str_ends_with($fullPath, '.m4s')) {
+            $contentType = 'video/iso.segment';
+        } elseif (str_ends_with($fullPath, '.mp4')) {
+            $contentType = 'video/mp4';
+        }
+        
+        Log::info("Serving DASH segment", [
+            'streamId' => $streamId,
+            'segmentPath' => $segmentPath,
+            'fullPath' => $fullPath,
+            'contentType' => $contentType
+        ]);
+        
+        return response()->stream(
+            function() use ($fullPath) {
+                echo file_get_contents($fullPath);
+            },
+            200,
+            [
+                'Content-Type' => $contentType,
+                'Access-Control-Allow-Origin' => '*',
+                'Access-Control-Allow-Methods' => 'GET, OPTIONS',
+                'Access-Control-Allow-Headers' => 'Origin, Content-Type, Accept, Authorization, X-Request-With',
+                'Cache-Control' => 'public, max-age=3600',
+            ]
+        );
+    }
+    
+    /**
+     * Proxy a remote HLS playlist
+     */
+    private function proxyRemotePlaylist($url)
+    {
+        Log::info("Proxying remote playlist", [
+            'url' => $url
+        ]);
+        
+        // Add cache busting to make sure we get the latest version
+        $separator = strpos($url, '?') !== false ? '&' : '?';
+        $url = $url . $separator . '_=' . time();
+        
+        // Get the remote playlist
+        $client = new \GuzzleHttp\Client();
+        try {
+            $response = $client->get($url);
+            $body = (string) $response->getBody();
+            
+            return response($body, 200, [
+                'Content-Type' => 'application/vnd.apple.mpegurl',
+                'Access-Control-Allow-Origin' => '*',
+                'Access-Control-Allow-Methods' => 'GET, OPTIONS',
+                'Access-Control-Allow-Headers' => 'Origin, Content-Type, Accept, Authorization, X-Request-With',
+                'Cache-Control' => 'no-cache, must-revalidate',
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Error proxying remote playlist", [
+                'url' => $url,
+                'error' => $e->getMessage()
+            ]);
+            return response()->json(['error' => 'Error proxying remote playlist: ' . $e->getMessage()], 500);
+        }
+    }
+    
+    /**
+     * Proxy a remote HLS segment
+     */
+    private function proxyRemoteSegment($baseUrl, $segmentId)
+    {
+        // Construct the segment URL
+        $segmentUrl = rtrim($baseUrl, '/') . '/' . $segmentId;
+        
+        Log::info("Proxying remote segment", [
+            'baseUrl' => $baseUrl,
+            'segmentId' => $segmentId,
+            'segmentUrl' => $segmentUrl
+        ]);
+        
+        // Get the remote segment
+        $client = new \GuzzleHttp\Client();
+        try {
+            $response = $client->get($segmentUrl);
+            $body = (string) $response->getBody();
+            
+            return response($body, 200, [
+                'Content-Type' => 'video/mp2t',
+                'Access-Control-Allow-Origin' => '*',
+                'Access-Control-Allow-Methods' => 'GET, OPTIONS',
+                'Access-Control-Allow-Headers' => 'Origin, Content-Type, Accept, Authorization, X-Request-With',
+                'Cache-Control' => 'public, max-age=3600',
+            ]);
+        } catch (\Exception $e) {
+            Log::error("Error proxying remote segment", [
+                'segmentUrl' => $segmentUrl,
+                'error' => $e->getMessage()
+            ]);
+            
+            // Return an empty segment as a fallback
+            return $this->createEmptySegment();
+        }
+    }
+    
+    /**
+     * Create an empty MPEG-TS segment as a fallback
+     */
+    private function createEmptySegment()
+    {
+        // Log the creation of an empty segment
+        Log::info("Creating empty segment as fallback");
+        
+        // Hard-coded minimal MPEG-TS segment data (188 bytes)
+        $data = $this->createHardcodedEmptySegment();
+        
+        return response($data, 200, [
+            'Content-Type' => 'video/MP2T',
+            'Content-Length' => strlen($data),
+            'Access-Control-Allow-Origin' => '*',
+            'Access-Control-Allow-Methods' => 'GET, OPTIONS',
+            'Access-Control-Allow-Headers' => 'Origin, Content-Type, Accept, Authorization, X-Request-With, Range',
+            'Cache-Control' => 'no-cache, must-revalidate'
+        ]);
+    }
+
+    /**
+     * Create a hardcoded empty MPEG-TS segment as a last resort fallback
+     */
+    private function createHardcodedEmptySegment()
+    {
+        Log::info("Using hardcoded empty segment as fallback");
+        
+        // A more robust empty MPEG-TS segment with proper headers
+        // This starts with a Transport Stream header (sync byte 0x47)
+        // followed by proper packet headers with adaptation fields
+        $tsHeader = chr(0x47) . chr(0x40) . chr(0x00) . chr(0x10) . chr(0x00);
+        $adaptationField = chr(0xB7) . str_repeat(chr(0xFF), 183); // Adaptation field with padding
+        
+        // Create a basic PAT and PMT structure
+        $pat = chr(0x47) . chr(0x40) . chr(0x00) . chr(0x10) . chr(0x00) . chr(0x00) . chr(0x00) . chr(0x00) . 
+               chr(0x00) . chr(0x00) . chr(0x01) . chr(0xF0) . chr(0x00);
+        $pmt = chr(0x47) . chr(0x50) . chr(0x00) . chr(0x10) . chr(0x00) . chr(0x02) . chr(0xB0) . chr(0x17) . 
+              chr(0x00) . chr(0x01) . chr(0xC1) . chr(0x00) . chr(0x00) . chr(0xE1) . chr(0x00) . 
+              chr(0xF0) . chr(0x00);
+              
+        // Generate multiple null packets to create a valid segment
+        $nullPackets = str_repeat($tsHeader . $adaptationField, 20);
+        
+        // Combine all elements into a complete TS segment
+        $completeSegment = $pat . $pmt . $nullPackets;
+        
+        Log::debug("Created hardcoded empty segment", [
+            'size' => strlen($completeSegment),
+            'firstBytes' => bin2hex(substr($completeSegment, 0, 10))
+        ]);
+        
+        return $completeSegment;
+    }
+    
+    /**
+     * Parse custom URL to check if it references another stream
+     * 
+     * @param string $url The custom URL to parse
+     * @param int $streamId The original stream ID
+     * @param int|null &$customStreamId Will be set to the custom stream ID if found
+     * @param bool &$customUrlIsLocal Will be set to true if the URL is local
+     * @return void
+     */
+    private function parseCustomStreamUrl($url, $streamId, &$customStreamId, &$customUrlIsLocal)
+    {
+        // Check if it's a local path pointing to another stream
+        if (preg_match('#/streams/(\d+)/playlist\.m3u8$#', $url, $matches)) {
+            $customStreamId = $matches[1];
+            $customUrlIsLocal = true;
+            Log::info("Stream has a custom URL pointing to another stream", [
+                'streamId' => $streamId,
+                'customStreamId' => $customStreamId,
+                'customUrl' => $url
+            ]);
+        }
+        // Also check for absolute paths to the storage folder
+        else if (preg_match('#/storage/app/public/streams/(\d+)/playlist\.m3u8$#', $url, $matches)) {
+            $customStreamId = $matches[1];
+            $customUrlIsLocal = true;
+            Log::info("Stream has a custom URL pointing to another stream (absolute path)", [
+                'streamId' => $streamId,
+                'customStreamId' => $customStreamId,
+                'customUrl' => $url
+            ]);
+        }
+        // Check for absolute paths to storage folder
+        else if (preg_match('#' . preg_quote(storage_path('app/public/streams/')) . '(\d+)/playlist\.m3u8$#', $url, $matches)) {
+            $customStreamId = $matches[1];
+            $customUrlIsLocal = true;
+            Log::info("Stream has a custom URL pointing to another stream (storage path)", [
+                'streamId' => $streamId,
+                'customStreamId' => $customStreamId,
+                'customUrl' => $url
+            ]);
+        }
+        // Check for absolute path or storage path
+        else if (strpos($url, '/') === 0 || strpos($url, 'storage/') === 0) {
+            $customUrlIsLocal = true;
+        }
+    }
+
+    /**
+     * Verify the integrity of a segment file
+     */
+    private function verifySegmentIntegrity($segmentPath) 
+    {
+        if (!file_exists($segmentPath)) {
+            Log::warning("Segment file does not exist", ['path' => $segmentPath]);
+            return false;
+        }
+        
+        if (filesize($segmentPath) < 188) { // Minimum size of valid TS packet
+            Log::warning("Segment file is too small to be valid", [
+                'path' => $segmentPath, 
+                'size' => filesize($segmentPath)
+            ]);
+            return false;
+        }
+        
+        // Read the first few bytes to verify it's a valid MPEG-TS file
+        // MPEG-TS files should start with the sync byte 0x47 (decimal 71)
+        $handle = fopen($segmentPath, 'rb');
+        $header = fread($handle, 4);
+        fclose($handle);
+        
+        if (empty($header) || ord($header[0]) !== 0x47) {
+            Log::warning("Segment doesn't start with valid TS sync byte", [
+                'path' => $segmentPath,
+                'firstByte' => empty($header) ? 'empty' : dechex(ord($header[0]))
+            ]);
+            return false;
+        }
+        
+        // Check for multiple TS packets with proper sync bytes (every 188 bytes)
+        try {
+            $handle = fopen($segmentPath, 'rb');
+            $isValid = true;
+            $fileSize = filesize($segmentPath);
+            $syncErrors = 0;
+            
+            // Check first 5 packets and last 5 packets (if file is large enough)
+            for ($i = 0; $i < 5 && ($i * 188) < $fileSize; $i++) {
+                fseek($handle, $i * 188, SEEK_SET);
+                $byte = fread($handle, 1);
+                if (empty($byte) || ord($byte) !== 0x47) {
+                    $syncErrors++;
+                }
+            }
+            
+            // Check end of file too
+            if ($fileSize > 188 * 10) {
+                for ($i = 1; $i <= 5 && ($fileSize - ($i * 188)) >= 0; $i++) {
+                    fseek($handle, $fileSize - ($i * 188), SEEK_SET);
+                    $byte = fread($handle, 1);
+                    if (empty($byte) || ord($byte) !== 0x47) {
+                        $syncErrors++;
+                    }
+                }
+            }
+            
+            fclose($handle);
+            
+            if ($syncErrors > 0) {
+                Log::warning("Segment has {$syncErrors} TS sync errors", ['path' => $segmentPath]);
+                return false;
+            }
+            
+            // Run a quick ffprobe check to verify the segment can be parsed
+            $command = "ffprobe -v error -show_entries packet=pts_time,dts_time,duration_time,stream_index -of json " . escapeshellarg($segmentPath) . " 2>&1";
+            exec($command, $output, $returnCode);
+            
+            if ($returnCode !== 0) {
+                Log::warning("FFprobe failed to analyze segment", [
+                    'path' => $segmentPath,
+                    'error' => implode("\n", $output)
+                ]);
+                return false;
+            }
+            
+            // Check if we can parse the output as valid JSON
+            $jsonOutput = implode('', $output);
+            $data = json_decode($jsonOutput, true);
+            
+            if (json_last_error() !== JSON_ERROR_NONE || empty($data) || !isset($data['packets']) || empty($data['packets'])) {
+                Log::warning("FFprobe produced invalid or empty packet data", [
+                    'path' => $segmentPath,
+                    'jsonError' => json_last_error_msg(),
+                    'sample' => substr($jsonOutput, 0, 200)
+                ]);
+                return false;
+            }
+            
+            Log::info("Segment passed integrity check", [
+                'path' => $segmentPath,
+                'packetCount' => count($data['packets'])
+            ]);
+            
+            return true;
+            
+        } catch (\Exception $e) {
+            Log::error("Exception during segment integrity check", [
+                'path' => $segmentPath,
+                'error' => $e->getMessage()
+            ]);
+            return false;
+        }
+    }
+    
+    /**
+     * Attempt to repair a corrupted TS segment
+     */
+    private function attemptSegmentRepair($segmentPath)
+    {
+        Log::info("Attempting to repair segment", ['segmentPath' => $segmentPath]);
+        
+        // Get a clean output path
+        $pathInfo = pathinfo($segmentPath);
+        $repairedPath = $pathInfo['dirname'] . '/' . $pathInfo['filename'] . '_repaired.' . $pathInfo['extension'];
+        
+        // Backup the original file
+        $backupPath = $segmentPath . '.backup';
+        if (!file_exists($backupPath)) {
+            copy($segmentPath, $backupPath);
+        }
+        
+        // Approach 1: Basic MPEG-TS remux with FFmpeg
+        $basicCommand = 'ffmpeg -y -i ' . escapeshellarg($segmentPath) . 
+                      ' -c copy -f mpegts -bsf:v h264_mp4toannexb ' .
+                      escapeshellarg($repairedPath) . ' 2>&1';
+                      
+        Log::info("Trying basic remux approach", ['command' => $basicCommand]);
+        
+        exec($basicCommand, $basicOutput, $basicReturnCode);
+        
+        if ($basicReturnCode === 0 && file_exists($repairedPath) && filesize($repairedPath) > 188) {
+            // Verify the repaired segment
+            if ($this->verifySegmentIntegrity($repairedPath)) {
+                Log::info("Segment repaired successfully with basic remux", [
+                    'originalPath' => $segmentPath,
+                    'repairedPath' => $repairedPath
+                ]);
+                return $repairedPath;
+            }
+            
+            Log::warning("Basic remux succeeded but segment still has issues");
+        }
+        
+        Log::warning("Basic remux failed", [
+            'returnCode' => $basicReturnCode,
+            'output' => $basicOutput
+        ]);
+        
+        return false;
+            return false;
+        }
+    }
+    
+    /**
+     * Serve a valid segment file, falling back to an empty segment if the file is invalid
+     * 
+     * @param string $segmentPath Path to the segment file
+     * @return \Illuminate\Http\Response
+     */
+    public function serveSegment($segmentPath)
+    {
+        if (!$this->verifySegmentIntegrity($segmentPath)) {
+            Log::warning("Segment failed integrity check, attempting repair", [
+                'segmentPath' => $segmentPath
+            ]);
+            
+            // Try to repair the segment
+            $repairedPath = $this->attemptSegmentRepair($segmentPath);
+            
+            if ($repairedPath) {
+                Log::info("Serving repaired segment", [
+                    'originalPath' => $segmentPath,
+                    'repairedPath' => $repairedPath
+                ]);
+                
+                return response()->file($repairedPath, [
+                    'Content-Type' => 'video/MP2T',
+                    'Cache-Control' => 'public, max-age=3600',
+                    'Connection' => 'keep-alive',
+                    'Access-Control-Allow-Origin' => '*',
+                    'Access-Control-Allow-Methods' => 'GET, OPTIONS',
+                    'Access-Control-Allow-Headers' => 'Origin, Content-Type, Accept, Authorization, X-Request-With, Range',
+                    'X-Accel-Buffering' => 'no' // Disable nginx buffering for streaming
+                ]);
+            }
+            
+            Log::warning("Segment repair failed, serving empty segment instead", [
+                'segmentPath' => $segmentPath
+            ]);
+            return $this->createEmptySegment();
+        }
+        
+        Log::info("Serving valid segment", [
+            'segmentPath' => $segmentPath,
+            'fileSize' => filesize($segmentPath)
+        ]);
+        
+        // Use readfile() to serve the content directly for better performance
+        return response()->stream(
+            function() use ($segmentPath) {
+                @readfile($segmentPath);
+            },
+            200,
+            [
+                'Content-Type' => 'video/MP2T',
+                'Content-Length' => filesize($segmentPath),
+                'Cache-Control' => 'public, max-age=3600',
+                'Connection' => 'keep-alive',
+                'Access-Control-Allow-Origin' => '*',
+                'Access-Control-Allow-Methods' => 'GET, OPTIONS',
+                'Access-Control-Allow-Headers' => 'Origin, Content-Type, Accept, Authorization, X-Request-With, Range',
+                'X-Accel-Buffering' => 'no' // Disable nginx buffering for streaming
+            ]
+        );
+    }
+
+    private function addCorsHeaders($response)
+    {
+        return $response->header('Access-Control-Allow-Origin', '*')
+                        ->header('Access-Control-Allow-Methods', 'GET, OPTIONS')
+                        ->header('Access-Control-Allow-Headers', 'Origin, Content-Type, Accept, Authorization, X-Request-With, Range');
+    }
+
+    /**
+     * Handle requests for empty.ts segment referenced in empty playlists
+     */
+    public function emptySegment()
+    {
+        Log::info("Serving empty segment file");
+        return $this->createEmptySegment();
+    }
