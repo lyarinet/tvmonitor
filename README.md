@@ -195,7 +195,7 @@ This software is licensed under the [MIT License](LICENSE.md).
 
 ## Credits
 
-Developed and maintained by Your Organization.
+Developed and maintained by Asifagaria by Lyarinet.
 
 For more information, please visit [example.com/tvmonitor](https://example.com/tvmonitor).
 # tvmonitor
