@@ -57,6 +57,10 @@ QUEUE_CONNECTION=redis
 ```
 
 ### 3. Database Setup
+```bash
+Database File is
+iptvmonitor.sql
+```
 
 ```bash
 # Run database migrations
